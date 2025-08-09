@@ -1,10 +1,11 @@
 import sys
 import threading
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QSizePolicy, QFrame, QProgressBar
+    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QSizePolicy, QFrame,
+    QProgressBar, QStackedWidget
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QPainter, QColor, QPen
 
 import pyqtgraph as pg
 
@@ -12,23 +13,128 @@ from ui.custom_widgets import CircularProgressBar
 from utils.helpers import format_bytes, format_network_speed
 from data.system_monitor import SystemMonitor
 
-class DashboardApp(QWidget):
+class PieChartSpinner(QWidget):
+    """
+    로딩 화면을 위한 파이 차트 스피너 위젯입니다.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(100, 100)
+        self.angle = 0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_angle)
+        self.timer.start(10) # 10ms 마다 업데이트
+    
+    def update_angle(self):
+        self.angle = (self.angle + 2) % 360 # 360도까지 2도씩 증가
+        self.update() # paintEvent 호출
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # 배경 원 그리기
+        painter.setPen(QPen(QColor(100, 100, 100), 8))
+        rect = self.rect().adjusted(10, 10, -10, -10)
+        painter.drawEllipse(rect)
+        
+        # 파이 조각 그리기
+        painter.setPen(QPen(QColor("#00ffb4"), 8))
+        # 0도에서 시작하여 self.angle만큼 그리기
+        painter.drawArc(rect, 90 * 16, -self.angle * 16) # 각도는 16으로 곱해야 함
+
+class LoadingScreen(QWidget):
+    """
+    애플리케이션 시작 시 표시되는 로딩 화면입니다.
+    파이 차트 스피너 애니메이션을 포함합니다.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet("background-color: #2b2b2b; color: white;")
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        # 파이 차트 스피너 위젯 추가
+        self.spinner = PieChartSpinner(self)
+        main_layout.addWidget(self.spinner, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        loading_label = QLabel("로딩 중...", self)
+        loading_label.setFont(QFont("Arial", 24, QFont.Weight.Bold))
+        loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        main_layout.addWidget(loading_label)
+
+class DashboardApp(QStackedWidget):
+    """
+    로딩 화면과 메인 대시보드 화면을 관리하는 주 애플리케이션 클래스입니다.
+    """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PC Dashboard")
-        
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setStyleSheet("background-color: rgba(43, 43, 43, 191); color: white; padding: 10px;")
 
-        main_layout = QVBoxLayout(self)
-        self.setLayout(main_layout)
+        # 시스템 모니터링 클래스 인스턴스 생성
+        self.monitor = SystemMonitor()
+        
+        # 로딩 화면 위젯 생성 및 추가
+        self.loading_screen = LoadingScreen()
+        self.addWidget(self.loading_screen)
+        
+        # 메인 대시보드 위젯 생성
+        self.main_dashboard_widget = QWidget()
+        self.setup_main_ui()
+        self.addWidget(self.main_dashboard_widget)
+        
+        # 모니터 선택 기능은 화면이 보여지기 전에 호출되어야 합니다.
+        self.show_on_specific_monitor(target="ZeroMOD")
+
+        # 초기 화면을 로딩 화면으로 설정
+        self.setCurrentIndex(0)
+
+        # 초기 데이터 로드를 위한 타이머 설정 (여기서는 메인 화면을 보여주기 전 로딩 시간)
+        QTimer.singleShot(2000, self.initialize_app)
+        
+        # 전체 화면으로 표시
+        self.showFullScreen()
+        
+    def initialize_app(self):
+        """
+        초기 설정을 완료하고 메인 대시보드로 전환하는 함수입니다.
+        """
+        # 로딩 화면의 타이머를 멈춥니다.
+        self.loading_screen.spinner.timer.stop()
+
+        # 정적 시스템 정보 초기 로드
+        self.get_static_system_info()
+        threading.Thread(target=self.get_external_ip).start()
+        
+        # 데이터 업데이트를 위한 타이머 설정
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.update_all_data)
+        self.update_timer.start(1000)
+        
+        # 로딩이 끝난 후 바로 메인 대시보드로 전환합니다.
+        self.setCurrentIndex(1)
+        
+    def setup_main_ui(self):
+        """
+        메인 대시보드의 UI를 구성합니다.
+        """
+        main_layout = QVBoxLayout(self.main_dashboard_widget)
         
         self.title_font = QFont("Arial", 12)
         self.title_font.setBold(True)
         self.content_font = QFont("Arial", 16)
         
-        # 시스템 모니터링 클래스 인스턴스 생성
-        self.monitor = SystemMonitor()
+        # 초기 데이터 로드를 위한 변수 설정
+        self.sent_data = []
+        self.received_data = []
+        self.cpu_data = []
+        self.ram_data = []
+        self.disk_read_data = []
+        self.disk_write_data = []
+        self.max_history = 100
         
         # UI 섹션 프레임 생성
         self.system_info_frame, system_info_layout = self.create_section_frame("System Information")
@@ -81,27 +187,6 @@ class DashboardApp(QWidget):
         self.create_network_widget("↑", network_layout, "sent")
         self.create_network_widget("↓", network_layout, "received")
         main_layout.addWidget(self.network_frame, stretch=2)
-        
-        # 데이터 업데이트를 위한 타이머 설정
-        self.update_timer = QTimer(self)
-        self.update_timer.timeout.connect(self.update_all_data)
-        self.update_timer.start(1000)
-        
-        # 초기 데이터 로드를 위한 변수 설정
-        self.sent_data = []
-        self.received_data = []
-        self.cpu_data = []
-        self.ram_data = []
-        self.disk_read_data = []
-        self.disk_write_data = []
-        self.max_history = 100
-        
-        # 정적 시스템 정보 초기 로드
-        self.get_static_system_info()
-        threading.Thread(target=self.get_external_ip).start()
-        
-        # 모니터 선택 기능
-        self.show_on_specific_monitor(target="ZeroMOD")
 
     def get_static_system_info(self):
         """SystemMonitor 클래스에서 정적 정보를 가져와 UI에 표시합니다."""
@@ -232,12 +317,12 @@ class DashboardApp(QWidget):
         if data_type == "sent":
             pen = pg.mkPen(color='#0000FF', width=2)
             self.sent_speed_label = speed_label
-            self.sent_total_label = total_label  # Total label 추가
+            self.sent_total_label = total_label
             self.sent_plot_data_item = chart_widget.plot(pen=pen)
         else:
             pen = pg.mkPen(color='#FF0000', width=2)
             self.received_speed_label = speed_label
-            self.received_total_label = total_label  # Total label 추가
+            self.received_total_label = total_label
             self.received_plot_data_item = chart_widget.plot(pen=pen)
         
         container_layout.addWidget(chart_widget, stretch=1)
@@ -395,4 +480,4 @@ class DashboardApp(QWidget):
         screen_geometry = target_screen.geometry()
         self.move(screen_geometry.topLeft())
         self.setFixedSize(screen_geometry.size())
-        self.showFullScreen()
+
