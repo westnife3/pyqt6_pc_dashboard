@@ -1,21 +1,16 @@
 import sys
 import threading
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QProgressBar, QSizePolicy, QFrame
+    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QSizePolicy, QFrame, QProgressBar
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
 
 import pyqtgraph as pg
-import psutil
-import time
-import requests
-import socket
-import platform
-import wmi
 
 from ui.custom_widgets import CircularProgressBar
-from utils.helpers import format_bytes
+from utils.helpers import format_bytes, format_network_speed
+from data.system_monitor import SystemMonitor
 
 class DashboardApp(QWidget):
     def __init__(self):
@@ -31,6 +26,9 @@ class DashboardApp(QWidget):
         self.title_font = QFont("Arial", 12)
         self.title_font.setBold(True)
         self.content_font = QFont("Arial", 16)
+        
+        # 시스템 모니터링 클래스 인스턴스 생성
+        self.monitor = SystemMonitor()
         
         # UI 섹션 프레임 생성
         self.system_info_frame, system_info_layout = self.create_section_frame("System Information")
@@ -49,8 +47,7 @@ class DashboardApp(QWidget):
         main_layout.addWidget(self.disk_usage_frame, stretch=2)
 
         self.cpu_cores_frame, cpu_cores_layout = self.create_section_frame("CPU Core Usage")
-        self.num_cores = psutil.cpu_count(logical=True)
-        self.core_usage_labels = []
+        self.num_cores = 0
         
         self.core_graph_widget = pg.PlotWidget()
         self.core_graph_widget.setBackground("#2b2b2b")
@@ -60,7 +57,7 @@ class DashboardApp(QWidget):
         self.core_graph_widget.hideAxis('bottom')
         self.core_graph_widget.hideAxis('left')
         
-        self.core_bar_graph_item = pg.BarGraphItem(x=list(range(self.num_cores)), height=[0]*self.num_cores, width=0.8, brush='#ffff00')
+        self.core_bar_graph_item = pg.BarGraphItem(x=[], height=[], width=0.8, brush='#ffff00')
         self.core_graph_widget.addItem(self.core_bar_graph_item)
         
         cpu_cores_layout.addWidget(self.core_graph_widget)
@@ -91,8 +88,6 @@ class DashboardApp(QWidget):
         self.update_timer.start(1000)
         
         # 초기 데이터 로드를 위한 변수 설정
-        self.last_net_stats = psutil.net_io_counters()
-        self.last_disk_stats = psutil.disk_io_counters()
         self.sent_data = []
         self.received_data = []
         self.cpu_data = []
@@ -101,56 +96,37 @@ class DashboardApp(QWidget):
         self.disk_write_data = []
         self.max_history = 100
         
-        self.boot_time = psutil.boot_time()
-        
+        # 정적 시스템 정보 초기 로드
         self.get_static_system_info()
         threading.Thread(target=self.get_external_ip).start()
         
-        # 모니터 선택 기능 (원래 코드의 기능 유지)
+        # 모니터 선택 기능
         self.show_on_specific_monitor(target="ZeroMOD")
 
-    # 시스템 정적 정보 (OS, CPU, GPU, BOARD 등)를 가져오는 메서드
     def get_static_system_info(self):
-        try:
-            wmi_obj = wmi.WMI()
+        """SystemMonitor 클래스에서 정적 정보를 가져와 UI에 표시합니다."""
+        info = self.monitor.get_static_system_info()
+        if info:
+            self.system_info_layout.addWidget(QLabel(info["os"], font=self.content_font))
+            self.system_info_layout.addWidget(QLabel(info["cpu"], font=self.content_font))
+            self.system_info_layout.addWidget(QLabel(info["gpu"], font=self.content_font))
+            self.system_info_layout.addWidget(QLabel(info["board"], font=self.content_font))
             
-            os_info = wmi_obj.Win32_OperatingSystem()[0]
-            proc_info = wmi_obj.Win32_Processor()[0]
-            gpu_info = wmi_obj.Win32_VideoController()[0]
-            board_info = wmi_obj.Win32_BaseBoard()[0]
-            
-            os_name = os_info.Name.encode('utf-8').split(b'|')[0].decode('utf-8').strip()
-            os_version = f"{os_info.Version} ({os_info.BuildNumber})"
-            
-            self.system_info_layout.addWidget(QLabel(f"OS | {os_name} {os_version}", font=self.content_font))
-            self.system_info_layout.addWidget(QLabel(f"CPU | {proc_info.Name}", font=self.content_font))
-            self.system_info_layout.addWidget(QLabel(f"GPU | {gpu_info.Name}", font=self.content_font))
-            self.system_info_layout.addWidget(QLabel(f"BOARD | {board_info.Product}", font=self.content_font))
-            
-            for i, disk in enumerate(wmi_obj.Win32_DiskDrive()):
-                disk_name = disk.Model.strip()
-                partitions = [p for p in disk.associators("Win32_DiskDriveToDiskPartition")]
+            for disk in info["disks"]:
+                used, total, percent = self.monitor.get_disk_usage(disk["device_id"])
                 
-                for partition in partitions:
-                    if partition:
-                        logical_disks = [ld for ld in partition.associators("Win32_LogicalDiskToPartition")]
-                        for ld in logical_disks:
-                            if ld.DriveType == 3:
-                                usage = psutil.disk_usage(ld.DeviceID)
-
-                                disk_container = QWidget()
-                                disk_layout = QVBoxLayout(disk_container)
-                                
-                                display_name = f"DISK{i} - {disk_name}"
-                                
-                                self.create_disk_widget(display_name, usage.used, usage.total, usage.percent, disk_layout, ld.DeviceID)
-                                
-                                self.disk_usage_layout.addWidget(disk_container)
+                disk_container = QWidget()
+                disk_layout = QVBoxLayout(disk_container)
+                
+                self.create_disk_widget(disk["name"], used, total, percent, disk_layout, disk["device_id"])
+                
+                self.disk_usage_layout.addWidget(disk_container)
             
-        except Exception as e:
-            print(f"Failed to get WMI info: {e}")
-            self.system_info_layout.addWidget(QLabel("WMI is not available or failed to load.", font=self.content_font))
-
+            # CPU 코어 수 초기화
+            cpu_percents = self.monitor.get_cpu_usage()
+            self.num_cores = len(cpu_percents)
+            self.core_bar_graph_item.setOpts(x=list(range(self.num_cores)), height=[0]*self.num_cores)
+            
     def create_section_frame(self, title):
         frame = QWidget()
         frame.setStyleSheet("border: 1px dashed #666666;")
@@ -221,65 +197,49 @@ class DashboardApp(QWidget):
         self.ip_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         parent_layout.addWidget(self.ip_label)
 
-    def get_internal_ip(self):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except Exception:
-            return "127.0.0.1"
-
     def get_external_ip(self):
-        self.internal_ip = self.get_internal_ip()
-        try:
-            response = requests.get('https://api.ipify.org?format=json', timeout=5)
-            response.raise_for_status()
-            external_ip = response.json().get('ip')
-            self.ip_label.setText(f"IP | {external_ip} ({self.internal_ip})")
-        except requests.exceptions.RequestException:
-            self.ip_label.setText(f"IP | Failed to fetch ({self.internal_ip})")
-        except Exception:
-            self.ip_label.setText(f"IP | Error ({self.internal_ip})")
+        """SystemMonitor 클래스에서 IP 주소를 가져와 UI에 표시합니다."""
+        internal_ip, external_ip = self.monitor.get_ips()
+        self.ip_label.setText(f"IP | {external_ip} ({internal_ip})")
         
     def create_network_widget(self, title, parent_layout, data_type):
         container = QWidget()
         container_layout = QHBoxLayout(container)
         text_layout = QVBoxLayout()
-        title_label = QLabel(f"{title}")
-        title_label.setFont(QFont("Arial", 24))
-        title_label.setFixedWidth(50)
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if data_type == "sent":
-            title_label.setStyleSheet("color: blue;")
-        else:
-            title_label.setStyleSheet("color: red;")
-        data_layout = QVBoxLayout()
+        
+        title_label = QLabel(f" {title} ")
+        title_label.setFont(self.title_font)
+        
         speed_label = QLabel("0.00KB/s")
         speed_label.setFont(QFont("Arial", 20))
-        total_label = QLabel("0.00GB")
-        total_label.setFont(self.content_font)
-        data_layout.addWidget(speed_label)
-        data_layout.addWidget(total_label)
-        container_layout.addWidget(title_label)
-        container_layout.addLayout(data_layout)
+
+        total_label = QLabel("0.00B")
+        total_label.setFont(QFont("Arial", 12))
+        
+        text_layout.addWidget(title_label)
+        text_layout.addWidget(speed_label)
+        text_layout.addWidget(total_label)
+        
+        container_layout.addLayout(text_layout)
+        
         chart_widget = pg.PlotWidget()
         chart_widget.setBackground("#2b2b2b")
         chart_widget.showGrid(x=False, y=False)
         chart_widget.hideAxis('bottom')
         chart_widget.hideAxis('left')
         chart_widget.setMinimumHeight(60)
+        
         if data_type == "sent":
             pen = pg.mkPen(color='#0000FF', width=2)
             self.sent_speed_label = speed_label
-            self.sent_total_label = total_label
+            self.sent_total_label = total_label  # Total label 추가
             self.sent_plot_data_item = chart_widget.plot(pen=pen)
         else:
             pen = pg.mkPen(color='#FF0000', width=2)
             self.received_speed_label = speed_label
-            self.received_total_label = total_label
+            self.received_total_label = total_label  # Total label 추가
             self.received_plot_data_item = chart_widget.plot(pen=pen)
+        
         container_layout.addWidget(chart_widget, stretch=1)
         parent_layout.addWidget(container)
 
@@ -345,62 +305,52 @@ class DashboardApp(QWidget):
 
     def update_all_data(self):
         # Uptime 업데이트
-        uptime_seconds = int(time.time() - self.boot_time)
-        days = uptime_seconds // (24 * 3600)
-        hours = (uptime_seconds % (24 * 3600)) // 3600
-        minutes = (uptime_seconds % 3600) // 60
-        seconds = uptime_seconds % 60
-        self.uptime_label.setText(f"{days} day{'s' if days != 1 else ''}, {hours:02d}:{minutes:02d}:{seconds:02d}")
+        self.uptime_label.setText(self.monitor.get_uptime())
         
         # 디스크 사용률 업데이트
         for device_id, widgets in self.disk_widgets.items():
-            try:
-                usage = psutil.disk_usage(device_id)
-                widgets["size_label"].setText(f"{format_bytes(usage.used)} / {format_bytes(usage.total)}")
-                widgets["progress_bar"].setValue(int(usage.percent))
-                widgets["circular_bar"].set_value(usage.percent)
-            except Exception as e:
-                print(f"Error updating disk usage for {device_id}: {e}")
+            used, total, percent = self.monitor.get_disk_usage(device_id)
+            if total > 0:
+                widgets["size_label"].setText(f"{format_bytes(used)} / {format_bytes(total)}")
+                widgets["progress_bar"].setValue(int(percent))
+                widgets["circular_bar"].set_value(percent)
                 
         # CPU 코어 사용률 업데이트
-        cpu_percents = psutil.cpu_percent(interval=None, percpu=True)
+        cpu_percents = self.monitor.get_cpu_usage()
+        if self.num_cores == 0:
+            self.num_cores = len(cpu_percents)
+            self.core_bar_graph_item.setOpts(x=list(range(self.num_cores)), height=[0]*self.num_cores)
+
         x_values = list(range(self.num_cores))
         y_values = [p for p in cpu_percents]
         self.core_bar_graph_item.setOpts(x=x_values, height=y_values)
         
         # 네트워크 사용량 업데이트
-        new_net_stats = psutil.net_io_counters()
-        sent_rate_kb = (new_net_stats.bytes_sent - self.last_net_stats.bytes_sent) / 1024
-        received_rate_kb = (new_net_stats.bytes_recv - self.last_net_stats.bytes_recv) / 1024
-        sent_total_gb = new_net_stats.bytes_sent / (1024 ** 3)
-        received_total_gb = new_net_stats.bytes_recv / (1024 ** 3)
+        sent_rate, received_rate, sent_total, received_total = self.monitor.get_network_stats()
         
-        self.sent_speed_label.setText(f"{sent_rate_kb:.2f}KB/s")
-        self.sent_total_label.setText(f"{sent_total_gb:.2f}GB")
-        self.received_speed_label.setText(f"{received_rate_kb:.2f}KB/s")
-        self.received_total_label.setText(f"{received_total_gb:.2f}GB")
+        self.sent_speed_label.setText(f"{format_network_speed(sent_rate)}")
+        self.sent_total_label.setText(f"{format_bytes(sent_total)}")
+        self.received_speed_label.setText(f"{format_network_speed(received_rate)}")
+        self.received_total_label.setText(f"{format_bytes(received_total)}")
         
-        self.sent_data.append(sent_rate_kb)
-        self.received_data.append(received_rate_kb)
+        self.sent_data.append(sent_rate)
+        self.received_data.append(received_rate)
         self.sent_plot_data_item.setData(self.sent_data)
         self.received_plot_data_item.setData(self.received_data)
-        self.last_net_stats = new_net_stats
 
         # 디스크 I/O 업데이트
-        new_disk_stats = psutil.disk_io_counters()
-        read_speed_kb = (new_disk_stats.read_bytes - self.last_disk_stats.read_bytes) / 1024
-        write_speed_kb = (new_disk_stats.write_bytes - self.last_disk_stats.write_bytes) / 1024
-        self.disk_read_label.setText(f"{read_speed_kb:.2f}KB/s")
-        self.disk_write_label.setText(f"{write_speed_kb:.2f}KB/s")
-        self.disk_read_data.append(read_speed_kb)
-        self.disk_write_data.append(write_speed_kb)
+        read_speed, write_speed = self.monitor.get_disk_io()
+        
+        self.disk_read_label.setText(f"{format_network_speed(read_speed)}")
+        self.disk_write_label.setText(f"{format_network_speed(write_speed)}")
+        self.disk_read_data.append(read_speed)
+        self.disk_write_data.append(write_speed)
         self.disk_read_plot_data_item.setData(self.disk_read_data)
         self.disk_write_plot_data_item.setData(self.disk_write_data)
-        self.last_disk_stats = new_disk_stats
 
         # CPU/RAM 사용량 그래프 업데이트
-        cpu_usage = psutil.cpu_percent(interval=None)
-        ram_usage = psutil.virtual_memory().percent
+        cpu_usage = sum(self.monitor.get_cpu_usage()) / len(self.monitor.get_cpu_usage()) if self.monitor.get_cpu_usage() else 0
+        ram_usage = self.monitor.get_ram_usage()
         self.cpu_data.append(cpu_usage)
         self.ram_data.append(ram_usage)
         self.cpu_percent_label.setText(f"{cpu_usage:.0f}%")
@@ -417,7 +367,6 @@ class DashboardApp(QWidget):
             self.disk_read_data.pop(0)
             self.disk_write_data.pop(0)
     
-    # 모니터 정보를 출력하고, 지정된 모니터에 대시보드를 표시하는 함수
     def show_on_specific_monitor(self, target="main"):
         screens = QApplication.instance().screens()
         primary_screen = QApplication.instance().primaryScreen()
